@@ -47,6 +47,8 @@ var (
 	procLoadCursorW        = user32.NewProc("LoadCursorW")
 	procLoadIconW          = user32.NewProc("LoadIconW")
 	procEnableWindow       = user32.NewProc("EnableWindow")
+	procSetTimer           = user32.NewProc("SetTimer")
+	procKillTimer          = user32.NewProc("KillTimer")
 	procGetDpiForWindow    = user32.NewProc("GetDpiForWindow")
 	procGetDpiForSystem    = user32.NewProc("GetDpiForSystem")
 	procAdjustWindowRectEx = user32.NewProc("AdjustWindowRectEx")
@@ -386,6 +388,15 @@ func enableWindow(hwnd uintptr, enable bool) {
 		v = 1
 	}
 	procEnableWindow.Call(hwnd, v)
+}
+
+// setTimer 每 ms 毫秒给 hwnd 发一次 wmTimer。id 用于区分并取消。
+func setTimer(hwnd uintptr, id uintptr, ms int) {
+	procSetTimer.Call(hwnd, id, uintptr(ms), 0)
+}
+
+func killTimer(hwnd uintptr, id uintptr) {
+	procKillTimer.Call(hwnd, id)
 }
 
 func isChecked(hwnd uintptr) bool {

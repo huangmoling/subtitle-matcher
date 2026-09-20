@@ -40,9 +40,13 @@ const (
 	wmCreate       = 0x0001
 	wmEraseBkgnd   = 0x0014
 	wmGetMinMaxInf = 0x0024
+	wmTimer        = 0x0113
 	wmApp          = 0x8000
 	wmAppRefresh   = wmApp + 1
 	wmAppDone      = wmApp + 2
+
+	// 秒表定时器：等待站点响应时没有进度事件，靠它让"用时"继续走
+	timerTick = 1
 )
 
 const (
@@ -95,6 +99,7 @@ type app struct {
 	shown    int
 	rendered []string
 	running  bool
+	stopping bool
 	cancel   context.CancelFunc
 	started  time.Time
 
@@ -453,6 +458,8 @@ func (a *app) refresh() {
 	}
 
 	switch {
+	case a.stopping:
+		setWindowText(a.hStatus, "正在停止…（已发出的请求会先结束）")
 	case a.running:
 		setWindowText(a.hStatus, fmt.Sprintf(
 			"进行中 %d / %d ｜ 成功 %d · 跳过 %d · 失败 %d ｜ 用时 %s",
@@ -515,11 +522,14 @@ func (a *app) start() {
 	a.rendered = nil
 	a.shown = 0
 	a.running = true
+	a.stopping = false
 	a.started = time.Now()
 	a.mu.Unlock()
 
 	sendMsg(a.hList, lvmDeleteAllItems, 0, 0)
 	a.refresh()
+
+	setTimer(a.hwnd, timerTick, 1000)
 
 	enableWindow(a.hStart, false)
 	enableWindow(a.hStop, true)
@@ -568,6 +578,7 @@ func (a *app) applyProgress(p progress) {
 func (a *app) stop() {
 	a.mu.Lock()
 	cancel := a.cancel
+	a.stopping = true
 	a.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -578,7 +589,10 @@ func (a *app) stop() {
 func (a *app) finish() {
 	a.mu.Lock()
 	a.running = false
+	a.stopping = false
 	a.mu.Unlock()
+
+	killTimer(a.hwnd, timerTick)
 
 	enableWindow(a.hStart, true)
 	enableWindow(a.hStop, false)
@@ -635,6 +649,12 @@ func wndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 
 	case wmAppDone:
 		a.finish()
+		return 0
+
+	case wmTimer:
+		if wparam == timerTick {
+			a.refresh()
+		}
 		return 0
 
 	case wmClose:
