@@ -2,6 +2,11 @@
 *.test
 *.out
 *.log
+*.exe~
+*.bak
+
+# 调试用的控制台版不进仓库（发行版只放 GUI 版）
+SubtitleCatMatcher-cli.exe
 
 # 编辑器与系统文件
 .vscode/

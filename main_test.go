@@ -94,7 +94,7 @@ func TestParseSearchSortsBySize(t *testing.T) {
 </tr>
 </tbody></table>`
 
-	rs := parseSearch(page)
+	rs := parseSCSearch(page)
 	if len(rs) != 2 {
 		t.Fatalf("应解析出 2 条结果, got %d", len(rs))
 	}
