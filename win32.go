@@ -49,6 +49,9 @@ var (
 	procEnableWindow       = user32.NewProc("EnableWindow")
 	procSetTimer           = user32.NewProc("SetTimer")
 	procKillTimer          = user32.NewProc("KillTimer")
+	procScreenToClient     = user32.NewProc("ScreenToClient")
+	procGetWindowLongPtrW  = user32.NewProc("GetWindowLongPtrW")
+	procSetWindowLongPtrW  = user32.NewProc("SetWindowLongPtrW")
 	procGetDpiForWindow    = user32.NewProc("GetDpiForWindow")
 	procGetDpiForSystem    = user32.NewProc("GetDpiForSystem")
 	procAdjustWindowRectEx = user32.NewProc("AdjustWindowRectEx")
@@ -117,6 +120,8 @@ const (
 	wmSize        = 0x0005
 	wmSetFont     = 0x0030
 	wmCommand     = 0x0111
+	wmNotify      = 0x004E
+	wmContextMenu = 0x007B
 	wmClose       = 0x0010
 	wmGetMinMaxInfo = 0x0024
 	wmSetIcon     = 0x0080
@@ -129,12 +134,38 @@ const (
 	emSetLimitText  = 0x00C5
 	lvmFirst        = 0x1000
 	lvmDeleteAllItems = lvmFirst + 9
+	lvmHitTest      = lvmFirst + 18
+	lvmGetHeader    = lvmFirst + 31
+	lvmSetItemState = lvmFirst + 43
 	lvmInsertItemW  = lvmFirst + 77
 	lvmSetItemTextW = lvmFirst + 116
 	lvmInsertColumnW = lvmFirst + 97
 	lvmSetExtendedListViewStyle = lvmFirst + 54
 	lvmEnsureVisible = lvmFirst + 19
 	lvmSetColumnWidth = lvmFirst + 30
+
+	// 表头（Header Control）
+	// 注意 HDM_FIRST+5、+6 是保留值，SETITEMW 在 +12，别按 GETITEMW(+11) 顺推。
+	hdmFirst     = 0x1200
+	hdmGetItemW  = hdmFirst + 11
+	hdmSetItemW  = hdmFirst + 12
+	hdiFormat    = 0x0004
+	hdfSortUp    = 0x0400
+	hdfSortDown  = 0x0200
+
+	// 通知码（WM_NOTIFY 的 NMHDR.code）。这些是"负的"标识符：
+	//   NM_FIRST  = (0U-0U)   = 0
+	//   LVN_FIRST = (0U-100U) = -100
+	// 写错就会静默收不到通知——LVN_COLUMNCLICK 是 -108，不是 -8。
+	lvnFirst        = -100
+	lvnColumnClick  = lvnFirst - 8
+	nmFirst         = 0
+	nmRClick        = nmFirst - 5
+
+	// 列表项状态位
+	lvisFocused  = 0x0001
+	lvisSelected = 0x0002
+
 	pbmSetRange32   = 0x0406
 	pbmSetPos       = 0x0402
 	pbmSetState     = 0x0404
@@ -183,7 +214,16 @@ const (
 	lvsReport          = 0x0001
 	lvsSingleSel       = 0x0004
 	lvsShowSelAlways   = 0x0008
-	lvsNoSortHeader    = 0x0040
+	// 注意：LVS_NOSORTHEADER 是 0x8000。0x0040 是 LVS_SHAREIMAGELISTS，
+	// 两者搞混会让"禁止列头排序"这个开关完全不生效。
+	lvsNoSortHeader = 0x8000
+
+	// 表头（Header）样式。HDS_BUTTONS 是列头可点、且会发 HDN_ITEMCLICK 的前提，
+	// 而 ListView 实测并不会自动加上它。
+	hdsButtons = 0x0001
+
+	// GetWindowLongPtrW / SetWindowLongPtrW 的索引，-16 = GWL_STYLE
+	gwlStyle = ^uintptr(15)
 	lvsExGridLines     = 0x00000001
 	lvsExFullRowSelect = 0x00000020
 	lvsExDoubleBuffer  = 0x00010000
@@ -330,6 +370,50 @@ type lvItemW struct {
 	iGroup     int32
 }
 
+// nmhdr 是 WM_NOTIFY 的 lParam 指向的头三个字段（64 位下占 24 字节，含尾部对齐）。
+type nmhdr struct {
+	hwndFrom uintptr
+	idFrom   uintptr
+	code     uint32
+}
+
+// nmListView 对应 NMLISTVIEW，LVN_COLUMNCLICK / NM_RCLICK 都用它。
+// 字段偏移：iItem 24、iSubItem 28、ptAction 44、lParam 56。
+type nmListView struct {
+	hdr       nmhdr
+	iItem     int32
+	iSubItem  int32
+	uNewState uint32
+	uOldState uint32
+	uChanged  uint32
+	ptAction  pointT
+	lParam    uintptr
+}
+
+// lvHitTestInfo 对应 LVHITTESTINFO，用于把鼠标坐标换成列表项下标。
+type lvHitTestInfo struct {
+	pt       pointT
+	flags    uint32
+	iItem    int32
+	iSubItem int32
+}
+
+// hdItemW 对应 HDITEMW，只用来读写表头的 fmt（排序箭头就藏在这里）。
+type hdItemW struct {
+	mask       uint32
+	cxy        int32
+	pszText    uintptr
+	hbm        uintptr
+	cchTextMax int32
+	fmt        int32
+	lParam     uintptr
+	iImage     int32
+	iOrder     int32
+	typ        uint32
+	pvFilter   uintptr
+	state      uint32
+}
+
 // ---------------------------------------------------------------- 小工具
 
 // 传给 Win32 的 UTF-16 缓冲区必须"活到系统读完为止"。
@@ -361,6 +445,12 @@ func utf16ptr(s string) uintptr {
 func loword(v uintptr) int { return int(v & 0xFFFF) }
 
 func hiword(v uintptr) int { return int((v >> 16) & 0xFFFF) }
+
+// lowordSigned / hiwordSigned 按有符号取：WM_CONTEXTMENU 的 lParam
+// 装的是屏幕坐标，可能为负（多显示器在主屏左侧时）。
+func lowordSigned(v uintptr) int32 { return int32(int16(v & 0xFFFF)) }
+
+func hiwordSigned(v uintptr) int32 { return int32(int16((v >> 16) & 0xFFFF)) }
 
 // sendMsg 向窗口/控件发送消息
 func sendMsg(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
@@ -397,6 +487,83 @@ func setTimer(hwnd uintptr, id uintptr, ms int) {
 
 func killTimer(hwnd uintptr, id uintptr) {
 	procKillTimer.Call(hwnd, id)
+}
+
+// ---------------------------------------------------------------- ListView 辅助
+
+// setSortIndicator 在表头对应列上画出排序箭头（▲ 升序 / ▼ 降序）。
+//
+// 表头的箭头位在 HDITEM.fmt 里，得先读出来再改，
+// 直接写 fmt 会把 HDF_STRING 之类的原始标志冲掉。
+func setSortIndicator(list uintptr, col int, asc bool) {
+	hdr := sendMsg(list, lvmGetHeader, 0, 0)
+	if hdr == 0 {
+		return
+	}
+	item := hdItemW{mask: hdiFormat}
+	sendMsg(hdr, hdmGetItemW, uintptr(col), uintptr(unsafe.Pointer(&item)))
+
+	item.fmt &^= hdfSortUp | hdfSortDown
+	if asc {
+		item.fmt |= hdfSortUp
+	} else {
+		item.fmt |= hdfSortDown
+	}
+	item.mask = hdiFormat
+	sendMsg(hdr, hdmSetItemW, uintptr(col), uintptr(unsafe.Pointer(&item)))
+}
+
+// clearSortIndicator 抹掉所有列的排序箭头。
+func clearSortIndicator(list uintptr, n int) {
+	hdr := sendMsg(list, lvmGetHeader, 0, 0)
+	if hdr == 0 {
+		return
+	}
+	for i := 0; i < n; i++ {
+		item := hdItemW{mask: hdiFormat}
+		sendMsg(hdr, hdmGetItemW, uintptr(i), uintptr(unsafe.Pointer(&item)))
+		item.fmt &^= hdfSortUp | hdfSortDown
+		item.mask = hdiFormat
+		sendMsg(hdr, hdmSetItemW, uintptr(i), uintptr(unsafe.Pointer(&item)))
+	}
+}
+
+// selectListItem 选中并聚焦第 i 项（右键复制时给用户一个视觉反馈）。
+func selectListItem(list uintptr, i int) {
+	it := lvItemW{
+		state:     lvisSelected | lvisFocused,
+		stateMask: lvisSelected | lvisFocused,
+	}
+	sendMsg(list, lvmSetItemState, uintptr(i), uintptr(unsafe.Pointer(&it)))
+}
+
+// listHitTest 把客户区坐标换成 (项下标, 子列下标)，都没命中时返回 -1。
+func listHitTest(list uintptr, x, y int32) (int, int) {
+	hi := lvHitTestInfo{pt: pointT{x: x, y: y}, iItem: -1, iSubItem: -1}
+	sendMsg(list, lvmHitTest, 0, uintptr(unsafe.Pointer(&hi)))
+	return int(hi.iItem), int(hi.iSubItem)
+}
+
+// enableHeaderButtons 给 ListView 的表头补上 HDS_BUTTONS。
+//
+// 别指望 ListView 自己加：实测本机 comctl32 v6 建出来的表头样式是
+// 0x500000c2（只有 HOTTRACK/DRAGDROP/FULLDRAG），没有 HDS_BUTTONS。
+// 缺了它，表头不会发 HDN_ITEMCLICK，ListView 也就不会往上抛
+// LVN_COLUMNCLICK —— 点列头排序会一点反应都没有。
+func enableHeaderButtons(list uintptr) {
+	hdr := sendMsg(list, lvmGetHeader, 0, 0)
+	if hdr == 0 {
+		return
+	}
+	style, _, _ := procGetWindowLongPtrW.Call(hdr, gwlStyle)
+	procSetWindowLongPtrW.Call(hdr, gwlStyle, style|hdsButtons)
+}
+
+// screenToClient 把屏幕坐标换成 hwnd 的客户区坐标。
+func screenToClient(hwnd uintptr, x, y int32) (int32, int32) {
+	pt := pointT{x: x, y: y}
+	procScreenToClient.Call(hwnd, uintptr(unsafe.Pointer(&pt)))
+	return pt.x, pt.y
 }
 
 func isChecked(hwnd uintptr) bool {

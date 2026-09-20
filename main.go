@@ -4,10 +4,10 @@
 //
 // 图形界面版：
 //  1. 点「浏览…」任选磁盘上的字幕库目录
-//  2. 自动列出目录下的番号文件夹（如 SNOS-115）
+//  2. 递归扫描目录下所有子目录里的视频文件（含 .strm 流占位文件）
 //  3. 并行到 subtitlecat.com / aiyi1.com / javzimu.com 搜索
 //  4. 哪个站有结果就用哪个；语言优先简体，其次繁体，同语言取文件最大的
-//  5. 下载后命名为「文件夹同名.srt」，已有字幕的文件夹自动跳过
+//  5. 下载后命名为「视频同名.srt」，视频已有同名字幕则自动跳过
 //
 // 双击即用，不需要命令行。
 //
@@ -26,7 +26,7 @@ import (
 	"sync"
 )
 
-const appTitle = "番号字幕匹配下载器 v2.0"
+const appTitle = "番号字幕匹配下载器 v2.1"
 
 func main() {
 	args := os.Args[1:]
@@ -60,9 +60,9 @@ const cliUsage = `番号字幕匹配下载器（控制台调试模式）
   SubtitleCatMatcher.exe -cli [选项] [目录]
 
 选项:
-  -all          不过滤番号，处理所有子文件夹
+  -all          不过滤番号，处理所有视频文件
   -raw          原样保存字幕，不修正时间轴格式
-  -jobs N       同时处理的文件夹数（默认 3）
+  -jobs N       同时处理的视频文件数（默认 3）
   -h            显示本帮助
 
 不带 -cli 直接运行会打开图形界面。
@@ -119,32 +119,32 @@ func runCLI(args []string) int {
 
 	cfg := config{OnlyCodes: onlyCodes, Normalize: normalize, SkipExisting: true, Concurrency: jobs}
 
-	folders, ignored, err := scanFolders(abs, cfg.OnlyCodes)
+	targets, ignored, err := scanVideos(abs, cfg.OnlyCodes)
 	if err != nil {
 		fmt.Println("读取目录失败:", err)
 		return 1
 	}
 	if len(ignored) > 0 {
-		fmt.Printf("已忽略 %d 个非番号文件夹\n", len(ignored))
+		fmt.Printf("已忽略 %d 个不像番号的视频\n", len(ignored))
 	}
-	if len(folders) == 0 {
-		fmt.Println("没有可处理的子文件夹")
+	if len(targets) == 0 {
+		fmt.Println("没有找到需要配字幕的视频文件")
 		return 0
 	}
 
-	fmt.Printf("目录: %s\n共 %d 个文件夹，并发 %d\n\n", abs, len(folders), cfg.Concurrency)
+	fmt.Printf("目录: %s\n共 %d 个视频文件，并发 %d\n\n", abs, len(targets), cfg.Concurrency)
 
 	var mu sync.Mutex
 	printed := map[int]string{}
 
-	sum := runAll(context.Background(), folders, cfg, func(p progress) {
+	sum := runAll(context.Background(), targets, cfg, func(p progress) {
 		if p.Status == stSearching {
 			return
 		}
 		mu.Lock()
 		defer mu.Unlock()
-		line := fmt.Sprintf("[%d/%d] %-16s %-9s %s",
-			p.Index+1, len(folders), filepath.Base(folders[p.Index]),
+		line := fmt.Sprintf("[%d/%d] %-22s %-9s %s",
+			p.Index+1, len(targets), targets[p.Index].Name,
 			p.Status.Text(), p.Detail)
 		if printed[p.Index] == line {
 			return

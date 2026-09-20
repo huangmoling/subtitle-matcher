@@ -18,12 +18,12 @@ import (
 // ---------------------------------------------------------------- 配置
 
 type config struct {
-	OnlyCodes    bool // 只处理看起来像番号的文件夹
+	OnlyCodes    bool // 只处理文件名看起来像番号的视频
 	Normalize    bool // 自动修正时间轴格式
-	SkipExisting bool // 文件夹里已有字幕则跳过
-	Concurrency  int  // 同时处理多少个文件夹
+	SkipExisting bool // 视频已有同名字幕则跳过
+	Concurrency  int  // 同时处理多少个视频
 
-	// SearchTimeout 是「单个文件夹的搜索阶段」总时限。
+	// SearchTimeout 是「单个视频的搜索阶段」总时限。
 	// 实测 aiyi1 的搜索接口偶尔会卡住几十秒，没有这个上限的话
 	// 一个卡住的站点就能把整个任务拖死。
 	SearchTimeout time.Duration
@@ -93,12 +93,13 @@ func (s rowStatus) Text() string {
 }
 
 type progress struct {
-	Index  int
-	Status rowStatus
-	Source string
-	Lang   string
-	Size   string
-	Detail string
+	Index     int
+	Status    rowStatus
+	Source    string
+	Lang      string
+	Size      string
+	SizeBytes int64 // 供界面按大小排序用；0 表示未知
+	Detail    string
 }
 
 type summary struct {
@@ -230,40 +231,116 @@ func shortErr(err error) string {
 
 // ---------------------------------------------------------------- 扫描
 
-// scanFolders 列出目录下的子文件夹。
-// onlyCodes 为真时只保留「看起来像番号」的目录名。
-func scanFolders(root string, onlyCodes bool) (folders, ignored []string, err error) {
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		if onlyCodes && !looksLikeCode(e.Name()) {
-			ignored = append(ignored, e.Name())
-			continue
-		}
-		folders = append(folders, filepath.Join(root, e.Name()))
-	}
-	sort.Strings(folders)
-	sort.Strings(ignored)
-	return folders, ignored, nil
+// videoExts 会被当成「需要配字幕的视频」的扩展名。
+//
+// .strm 是 Jellyfin / Emby 的流地址占位文件（内容只是一行 URL），
+// 本地媒体库里大量存在，必须一起认。
+var videoExts = map[string]bool{
+	".strm": true,
+	".mp4":  true, ".mkv": true, ".avi": true, ".wmv": true, ".mov": true,
+	".m4v": true, ".ts": true, ".m2ts": true, ".mts": true,
+	".mpg": true, ".mpeg": true, ".flv": true, ".webm": true,
+	".rmvb": true, ".rm": true, ".divx": true, ".3gp": true,
 }
 
-// hasSubtitle 判断目录内是否已存在字幕文件
-func hasSubtitle(dir string) (string, bool) {
-	entries, err := os.ReadDir(dir)
+// skipDirs 是递归时要跳过的目录名：系统/同步软件生成的杂物，
+// 里面不可能有视频，扫进去只会浪费时间。
+var skipDirs = map[string]bool{
+	"@eaDir": true, "#recycle": true, "$RECYCLE.BIN": true,
+	"System Volume Information": true, "node_modules": true,
+}
+
+// target 一个待配字幕的视频文件。
+//
+// 注意：处理单位是「视频文件」而不是「文件夹」。
+// 一个字幕库目录下可能有多层子目录、一个目录里也可能有多个视频，
+// 每个视频都要单独配一份以它自己命名的字幕。
+type target struct {
+	Path string // 完整路径
+	Dir  string // 所在目录
+	Name string // 文件名（含扩展名），如 SNOS-115.strm
+	Base string // 去掉扩展名的文件名，字幕就用它命名
+	Rel  string // 所在目录相对扫描根目录的路径，用于界面显示
+}
+
+// scanVideos 递归扫描 root 下所有子目录里的视频文件。
+// onlyCodes 为真时只保留「文件名看起来像番号」的。
+func scanVideos(root string, onlyCodes bool) (targets []target, ignored []string, err error) {
+	if st, e := os.Stat(root); e != nil || !st.IsDir() {
+		return nil, nil, fmt.Errorf("目录不存在或不可访问: %s", root)
+	}
+
+	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, e error) error {
+		if e != nil {
+			// 单个子目录读不了（权限/被占用）不该让整次扫描失败
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if path != root && (skipDirs[name] || strings.HasPrefix(name, ".")) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		ext := strings.ToLower(filepath.Ext(d.Name()))
+		if !videoExts[ext] {
+			return nil
+		}
+
+		base := strings.TrimSuffix(d.Name(), filepath.Ext(d.Name()))
+		if base == "" {
+			return nil
+		}
+		if onlyCodes && !looksLikeCode(base) {
+			ignored = append(ignored, d.Name())
+			return nil
+		}
+
+		dir := filepath.Dir(path)
+		rel, relErr := filepath.Rel(root, dir)
+		if relErr != nil || rel == "" {
+			rel = "."
+		}
+		targets = append(targets, target{
+			Path: path, Dir: dir, Name: d.Name(), Base: base, Rel: rel,
+		})
+		return nil
+	})
+	if walkErr != nil {
+		return nil, nil, walkErr
+	}
+
+	// 按完整路径排序，保证每次运行顺序一致
+	sort.Slice(targets, func(i, j int) bool { return targets[i].Path < targets[j].Path })
+	sort.Strings(ignored)
+	return targets, ignored, nil
+}
+
+// hasSubtitleFor 判断该视频是否已经有同名（去扩展名后）的字幕。
+//
+// 用「视频文件名」而不是「目录里有没有字幕」来判断：
+// 一个目录里可能有好几个视频，只看目录会把它们全误判成"已有字幕"。
+func hasSubtitleFor(t target) (string, bool) {
+	entries, err := os.ReadDir(t.Dir)
 	if err != nil {
 		return "", false
 	}
+	want := strings.ToLower(t.Base)
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		if subtitleExts[strings.ToLower(filepath.Ext(e.Name()))] {
-			return e.Name(), true
+		name := e.Name()
+		if !subtitleExts[strings.ToLower(filepath.Ext(name))] {
+			continue
+		}
+		stem := strings.TrimSuffix(name, filepath.Ext(name))
+		if strings.ToLower(stem) == want {
+			return name, true
 		}
 	}
 	return "", false
@@ -276,11 +353,11 @@ type outcome struct {
 	detail string
 }
 
-func (ss *sourceSet) processFolder(ctx context.Context, dir string, cfg config, report func(progress)) outcome {
-	name := filepath.Base(dir)
+func (ss *sourceSet) processTarget(ctx context.Context, t target, cfg config, report func(progress)) outcome {
+	name := t.Base
 
 	if cfg.SkipExisting {
-		if existing, ok := hasSubtitle(dir); ok {
+		if existing, ok := hasSubtitleFor(t); ok {
 			return outcome{stSkipped, "已有字幕 " + existing}
 		}
 	}
@@ -334,15 +411,16 @@ func (ss *sourceSet) processFolder(ctx context.Context, dir string, cfg config, 
 		}
 
 		report(progress{
-			Status: stDownloading,
-			Source: c.Source,
-			Lang:   c.Lang,
-			Size:   c.SizeText,
-			Detail: fmt.Sprintf("选中 %s · %s · %s", c.Source, c.Lang, c.SizeText),
+			Status:    stDownloading,
+			Source:    c.Source,
+			Lang:      c.Lang,
+			Size:      c.SizeText,
+			SizeBytes: c.Size,
+			Detail:    fmt.Sprintf("选中 %s · %s · %s", c.Source, c.Lang, c.SizeText),
 		})
 
 		dlCtx, cancelDL := context.WithTimeout(ctx, cfg.DownloadTimeout)
-		saved, n, fixed, err := ss.download(dlCtx, c, dir, name, cfg.Normalize)
+		saved, n, fixed, err := ss.download(dlCtx, c, t.Dir, name, cfg.Normalize)
 		cancelDL()
 		if err == nil {
 			detail := fmt.Sprintf("%s · %s · %s → %s", c.Source, c.Lang, humanSize(n), saved)
@@ -356,7 +434,7 @@ func (ss *sourceSet) processFolder(ctx context.Context, dir string, cfg config, 
 	return outcome{stFailed, "下载失败: " + shortErr(lastErr)}
 }
 
-// download 下载选中的候选并按内容决定扩展名，落盘为「文件夹同名.后缀」。
+// download 下载选中的候选并按内容决定扩展名，落盘为「视频同名.后缀」。
 func (ss *sourceSet) download(ctx context.Context, c candidate, dir, baseName string, normalize bool) (string, int64, bool, error) {
 	g := ss.dl
 	if g == nil {
@@ -389,8 +467,8 @@ func (ss *sourceSet) download(ctx context.Context, c candidate, dir, baseName st
 	return baseName + ext, int64(len(data)), fixed, nil
 }
 
-// runAll 并发处理所有文件夹，边处理边通过 report 汇报进度。
-func runAll(ctx context.Context, folders []string, cfg config, report func(progress)) summary {
+// runAll 并发处理所有视频文件，边处理边通过 report 汇报进度。
+func runAll(ctx context.Context, targets []target, cfg config, report func(progress)) summary {
 	cfg = cfg.withDefaults()
 	ss := newSourceSet()
 
@@ -406,14 +484,14 @@ func runAll(ctx context.Context, folders []string, cfg config, report func(progr
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var sum summary
-	sum.Total = len(folders)
+	sum.Total = len(targets)
 
-	for i, dir := range folders {
+	for i, t := range targets {
 		if ctx.Err() != nil {
 			break
 		}
 		wg.Add(1)
-		go func(i int, dir string) {
+		go func(i int, t target) {
 			defer wg.Done()
 
 			sem <- struct{}{}
@@ -424,7 +502,7 @@ func runAll(ctx context.Context, folders []string, cfg config, report func(progr
 			}
 			report(progress{Index: i, Status: stSearching, Detail: "并行搜索中…"})
 
-			oc := ss.processFolder(ctx, dir, cfg, func(p progress) {
+			oc := ss.processTarget(ctx, t, cfg, func(p progress) {
 				p.Index = i
 				report(p)
 			})
@@ -441,7 +519,7 @@ func runAll(ctx context.Context, folders []string, cfg config, report func(progr
 			mu.Unlock()
 
 			report(progress{Index: i, Status: oc.status, Detail: oc.detail})
-		}(i, dir)
+		}(i, t)
 	}
 
 	wg.Wait()
