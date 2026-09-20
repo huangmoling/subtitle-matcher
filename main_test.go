@@ -2,7 +2,11 @@
 
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"unicode/utf16"
+)
 
 // 模拟 subtitlecat 详情页中的语言区块
 func block(lang, href string) string {
@@ -118,5 +122,160 @@ func TestLooksLikeCode(t *testing.T) {
 		if looksLikeCode(s) {
 			t.Errorf("不应识别为番号: %q", s)
 		}
+	}
+}
+
+// aisubs.app 来源的字幕用 "->" 和全角冒号，曾经被误判成"被站点拦截"
+const aisubsSample = "0\n00：00：00.000-> 00：00：02.000\n  你\n\n1\n00：00：30.000-> 00：00：32.000\n  我\n"
+
+func TestLooksLikeSubtitle(t *testing.T) {
+	standard := "1\n00:00:01,000 --> 00:00:02,000\n你好\n"
+	webvtt := "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n你好\n"
+	blocked := "<!DOCTYPE html>\n<html><head><title>Just a moment...</title></head></html>"
+	blocked2 := "<html>\n<body>Access denied</body>\n</html>"
+
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"标准 SRT", standard, true},
+		{"WebVTT", webvtt, true},
+		{"aisubs 非标准格式", aisubsSample, true},
+		{"Cloudflare 拦截页", blocked, false},
+		{"拒绝访问页", blocked2, false},
+		{"空内容", "", false},
+	}
+	for _, c := range cases {
+		if got := looksLikeSubtitle([]byte(c.in)); got != c.want {
+			t.Errorf("%s: looksLikeSubtitle = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestNormalizeSubtitle(t *testing.T) {
+	want := "0\n00:00:00,000 --> 00:00:02,000\n  你\n\n1\n00:00:30,000 --> 00:00:32,000\n  我\n"
+	out, changed := normalizeSubtitle([]byte(aisubsSample))
+	if !changed {
+		t.Fatal("aisubs 格式应报告发生了修改")
+	}
+	if string(out) != want {
+		t.Errorf("规范化结果不符\n got: %q\nwant: %q", out, want)
+	}
+
+	// 已经是标准格式 → 一个字节都不该动
+	std := "1\n00:00:01,000 --> 00:00:02,000\n你好\n"
+	out2, changed2 := normalizeSubtitle([]byte(std))
+	if changed2 {
+		t.Error("标准 SRT 不应报告修改")
+	}
+	if string(out2) != std {
+		t.Errorf("标准 SRT 内容被改动: %q", out2)
+	}
+
+	// 正文里的全角冒号和箭头不能被误改
+	body := "1\n00:00:01,000 --> 00:00:02,000\n他说：A->B\n"
+	out3, changed3 := normalizeSubtitle([]byte(body))
+	if changed3 {
+		t.Error("时间轴标准时不应因正文含特殊字符而改动")
+	}
+	if string(out3) != body {
+		t.Errorf("正文被误改: %q", out3)
+	}
+
+	// 毫秒位数不足要补齐
+	short := "0\n0：0：1.5-> 0：0：2.25\n嗨\n"
+	out4, _ := normalizeSubtitle([]byte(short))
+	if !strings.Contains(string(out4), "00:00:01,500 --> 00:00:02,250") {
+		t.Errorf("毫秒补齐失败: %q", out4)
+	}
+}
+
+// 站点部分字幕把零宽空格塞进时间轴数字中间，真实数据里出现过
+func TestNormalizeSubtitleZeroWidth(t *testing.T) {
+	in := "0\n00：01：46.0\u200b\u200b00-> 00：01：47.000\n  你\n"
+	want := "0\n00:01:46,000 --> 00:01:47,000\n  你\n"
+	out, changed := normalizeSubtitle([]byte(in))
+	if !changed {
+		t.Fatal("含零宽空格的时间轴应被规范化")
+	}
+	if string(out) != want {
+		t.Errorf("零宽空格处理失败\n got: %q\nwant: %q", out, want)
+	}
+	if strings.ContainsRune(string(out), '\u200b') {
+		t.Error("输出里仍残留零宽空格")
+	}
+
+	// 正文里的零宽空格也应清掉，且不应破坏正文其余部分
+	body := "1\n00:00:01,000 --> 00:00:02,000\n你\u200b好\n"
+	out2, changed2 := normalizeSubtitle([]byte(body))
+	if !changed2 {
+		t.Error("正文含零宽空格时应报告修改")
+	}
+	if string(out2) != "1\n00:00:01,000 --> 00:00:02,000\n你好\n" {
+		t.Errorf("正文清理结果不符: %q", out2)
+	}
+
+	// ZWJ（U+200D）有语义，不能被误删
+	zwj := "1\n00:00:01,000 --> 00:00:02,000\n👨\u200d👩\n"
+	out3, _ := normalizeSubtitle([]byte(zwj))
+	if !strings.Contains(string(out3), "\u200d") {
+		t.Error("ZWJ 被误删，emoji 会被破坏")
+	}
+}
+
+// 源文件里真实存在的几种损坏写法
+func TestNormalizeSubtitleMalformed(t *testing.T) {
+	cases := map[string]string{
+		// 分钟被重复了一次
+		"01：59：18.940-> 02：12：12：18.190": "01:59:18,940 --> 02:12:18,190",
+		// 毫秒 4 位
+		"01：06：27.200-> 01：06：29.2900": "01:06:27,200 --> 01:06:29,290",
+		// 两者同时出现
+		"02：12：48.280-> 02：12：12：50.280": "02:12:48,280 --> 02:12:50,280",
+		// 正常的也要保持正确
+		"00：00：00.000-> 00：00：02.000": "00:00:00,000 --> 00:00:02,000",
+	}
+	for in, want := range cases {
+		got, ok := parseTimestampLine(in)
+		if !ok {
+			t.Errorf("应能解析: %q", in)
+			continue
+		}
+		if got != want {
+			t.Errorf("\n in: %q\n got: %q\nwant: %q", in, got, want)
+		}
+	}
+
+	// 重复段不相等 → 不敢猜，保持原样
+	if out, ok := parseTimestampLine("01:02:03:04.500-> 01:02:03,500"); ok {
+		t.Errorf("重复段不相等时不应改写，却改成了 %q", out)
+	}
+
+	// 正文里的箭头不能被当成时间轴
+	if out, ok := parseTimestampLine("他说：A->B"); ok {
+		t.Errorf("正文被误判为时间轴: %q", out)
+	}
+
+	// 结尾带 \r 的 CRLF 行要保留 \r
+	if got, ok := parseTimestampLine("00：00：01.000-> 00：00：02.000\r"); !ok || got != "00:00:01,000 --> 00:00:02,000\r" {
+		t.Errorf("CRLF 处理失败: ok=%v got=%q", ok, got)
+	}
+}
+
+func TestNormalizeSubtitleUTF16(t *testing.T) {
+	src := "1\n00:00:01,000 --> 00:00:02,000\n你好\n"
+	u := utf16.Encode([]rune(src))
+	buf := []byte{0xFF, 0xFE} // UTF-16LE BOM
+	for _, c := range u {
+		buf = append(buf, byte(c), byte(c>>8))
+	}
+
+	out, changed := normalizeSubtitle(buf)
+	if !changed {
+		t.Fatal("UTF-16 应被转成 UTF-8")
+	}
+	if string(out) != src {
+		t.Errorf("转码结果不符\n got: %q\nwant: %q", out, src)
 	}
 }
