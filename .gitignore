@@ -1,0 +1,10 @@
+# 编译 / 测试临时产物
+*.test
+*.out
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

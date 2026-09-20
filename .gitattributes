@@ -1,0 +1,10 @@
+# 统一换行符，避免 Windows/Linux 协作时产生无意义 diff
+*.go   text eol=lf
+*.md   text eol=lf
+*.mod  text eol=lf
+*.manifest text eol=lf
+
+# 二进制资源
+*.exe  binary
+*.ico  binary
+*.syso binary
